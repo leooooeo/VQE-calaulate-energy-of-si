@@ -1,0 +1,197 @@
+!pip install qiskit-nature[pyscf] -U
+
+from qiskit_nature.units import DistanceUnit
+from qiskit_nature.second_q.drivers import PySCFDriver,ElectronicStructureDriver
+from qiskit_nature.second_q.mappers import JordanWignerMapper
+from qiskit_algorithms import VQE
+from qiskit_algorithms.optimizers import SLSQP, COBYLA, L_BFGS_B
+from qiskit.primitives import Estimator
+from qiskit_nature.second_q.circuit.library import HartreeFock, UCCSD
+from qiskit_nature.second_q.algorithms import GroundStateEigensolver
+import numpy as np
+from qiskit_nature.second_q.transformers import FreezeCoreTransformer, ActiveSpaceTransformer
+import time
+from qiskit_nature.second_q.algorithms import QEOM
+from qiskit_nature.second_q.algorithms import ExcitedStatesEigensolver
+from qiskit_nature.second_q.circuit.library import UCCSD
+from qiskit.circuit.library import EfficientSU2
+import matplotlib.pyplot as plt
+
+import qiskit
+print(qiskit.__version__)
+
+driver = PySCFDriver(
+    atom='Si 0 0 0',
+    basis='sto-3g',
+    unit=DistanceUnit.ANGSTROM
+)
+
+
+problem = driver.run()
+
+#transformer = FreezeCoreTransformer()
+transformer = ActiveSpaceTransformer(2,3)
+problem = transformer.transform(problem)
+
+
+
+# Solve electronic structure problem
+second_q_op = problem.second_q_ops()
+
+# Convert to qubit operator using Jordan-Wigner transformation
+mapper = JordanWignerMapper()
+qubit_op = mapper.map(second_q_op[0])
+
+estimator = Estimator()
+optimizers = [SLSQP(maxiter=1000)]
+converge_counts = np.empty((len(optimizers),), dtype=object)
+converge_vals = np.empty((len(optimizers),), dtype=object)
+
+name_opt = {0: 'SLSQP', 1: 'COBYLA', 2: 'L_BFGS_B'}
+ground_state_energies = []
+lowest_excited_state_energies = []
+
+for i, optimizer in enumerate(optimizers):
+    print('#' * 25)
+    print(f'Optimizer: {name_opt[i]}', end="")
+    np.random.seed(0)
+
+    ansatz = EfficientSU2(num_qubits=qubit_op.num_qubits, reps=3, entanglement='linear', insert_barriers=True)
+    counts = []
+    values = []
+
+    def store_intermediate_result(eval_count, parameters, mean, std):
+        counts.append(eval_count)
+        values.append(mean)
+
+    start_time = time.time()
+    new_var = 0.01
+    k = np.random.rand(48) * np.pi * new_var  # Random initial points
+    vqe = VQE(estimator, ansatz, optimizer, initial_point=k, callback=store_intermediate_result)
+    result = vqe.compute_minimum_eigenvalue(operator=qubit_op)
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print('%' * 25)
+    print(f"%%%%%%%% Elapsed time: {elapsed_time} seconds %%%%%%%%")
+    print('%' * 25)
+
+    print(result)
+    converge_counts[i] = np.asarray(counts)
+    converge_vals[i] = np.asarray(values)
+
+    # Extract ground state energy
+    ground_state_energy = result.eigenvalue.real
+    ground_state_energies.append(ground_state_energy)
+
+    print(f"Ground state energy for optimizer {name_opt[i]}: {ground_state_energy}")
+
+print("Ground state energy calculation complete")
+
+optimizers = [SLSQP(maxiter=2000)]
+
+lowest_excited_state_energies = []
+ground_state_energies = []
+excited_state_energy = [[],[],[]]
+
+for i, optimizer in enumerate(optimizers):
+    print('#' * 25)
+    print(f'Optimizer: SLSQP', end="")
+    np.random.seed(0)
+
+    # Increase ansatz complexity
+    ansatz = EfficientSU2(num_qubits=qubit_op.num_qubits, reps=1, entanglement='linear', insert_barriers=True)
+    counts = []
+    values = []
+
+    def store_intermediate_result(eval_count, parameters, mean, std):
+        counts.append(eval_count)
+        values.append(mean)
+
+    k = np.random.rand(ansatz.num_parameters) * np.pi * 0.1  # Random initial points
+    vqe = VQE(estimator, ansatz, optimizer, initial_point=k, callback=store_intermediate_result)
+    result = vqe.compute_minimum_eigenvalue(operator=qubit_op)
+
+    ground_state_energy = result.eigenvalue.real
+    ground_state_energies.append(ground_state_energy)
+
+    # Set up the Ground State Solver
+    gsc = GroundStateEigensolver(mapper, vqe)
+
+    # Use QEOM for excited states
+    qeom_solver = QEOM(gsc, estimator, excitations='sd')
+    qeom_result = qeom_solver.solve(problem)
+
+    # Extract excited state energies
+    excited_state_energies = qeom_result.eigenvalues
+
+    # Print excited state energies
+    print(f"Excited state energies for optimizer SLSQP: {excited_state_energies}")
+
+    # Find the lowest excited state energy
+    sorted_excited_state_energies = np.sort(excited_state_energies)
+    for j,energy in enumerate(sorted_excited_state_energies):
+      if energy > excited_state_energies[0]:
+        lowest_excited_state_energy = energy
+        excited_state_energy[i] = sorted_excited_state_energies[0:]
+        break
+    lowest_excited_state_energies.append(lowest_excited_state_energy)
+
+    print(f"Lowest excited state energy for optimizer SLSQP: {lowest_excited_state_energy}")
+print("Excited state energy calculation complete")
+
+# Plot the ground state and lowest excited state energies
+plt.figure(figsize=(10, 6))
+
+for i, optimizer in enumerate(optimizers):
+    plt.plot([0, 1], [ground_state_energies[i], lowest_excited_state_energies[i]], 'o-', label=f"{name_opt[i]}")
+    plt.text(0, ground_state_energies[i], f"{ground_state_energies[i]:.4f}", ha='right')
+    plt.text(1, lowest_excited_state_energies[i], f"{lowest_excited_state_energies[i]:.4f}", ha='left')
+
+plt.xticks([0, 1], ['Ground State', 'Lowest Excited State'])
+plt.xlabel('State')
+plt.ylabel('Energy (Hartree)')
+plt.title('Ground and Lowest Excited State Energies for Different Optimizers')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+band_gaps = []
+
+for i in range(len(lowest_excited_state_energies)):
+    band_gap = (lowest_excited_state_energies[i] - ground_state_energies[i]) * 27.2114  # 将Hartree单位转换为eV
+    band_gaps.append(band_gap)
+    print(f"Band gap for optimizer {name_opt[i]}: {band_gap} eV")
+
+# Plot the band gaps
+plt.figure(figsize=(10, 6))
+
+for i, optimizer in enumerate(optimizers):
+    plt.plot([0], [band_gaps[i]], 'o', label=f"{name_opt[i]}")
+    plt.text(0, band_gaps[i], f"{band_gaps[i]:.4f}", ha='right')
+
+plt.xticks([0], ['Band Gap'])
+plt.xlabel('Band Gap')
+plt.ylabel('Energy (eV)')
+plt.title('Band Gaps for Different Optimizers')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+excited_state_energy = excited_state_energy[0]
+y_values = np.insert(excited_state_energy, 0, ground_state_energy)
+x_values = np.arange(len(y_values))/5
+
+
+plt.figure(figsize=(10, 6))
+plt.plot(x_values, y_values, 'o-', color='b', label='SLSQP')
+
+
+plt.xlabel('State Index')
+plt.ylabel('Energy')
+plt.title('Energy Band Diagram for Optimal Optimizer')
+plt.legend()
+plt.grid(True)
+#plt.xticks(x_values, labels=['Ground State'] + [f'Excited State {i}' for i in range(1, len(y_values))])
+
+
+plt.show()
